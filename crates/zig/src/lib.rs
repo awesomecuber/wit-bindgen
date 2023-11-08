@@ -1,9 +1,9 @@
 use std::fmt::Write;
 
-use heck::ToSnakeCase;
+use heck::{ToLowerCamelCase, ToSnakeCase, ToUpperCamelCase};
 use wit_bindgen_core::{
     abi::{AbiVariant, Bindgen, Instruction, LiftLower, WasmType},
-    uwrite, uwriteln,
+    uwriteln,
     wit_parser::{
         Docs, Enum, Flags, Function, InterfaceId, Record, Resolve, Result_, Results, SizeAlign,
         Tuple, Type, TypeId, Variant, WorldId, WorldKey,
@@ -27,7 +27,8 @@ impl Opts {
 #[derive(Default)]
 pub struct Zig {
     _opts: Opts,
-    src: Source,
+    imports: Source,
+    exports: Source,
 }
 
 impl WorldGenerator for Zig {
@@ -39,18 +40,22 @@ impl WorldGenerator for Zig {
         _files: &mut Files,
     ) {
         let name_raw = &resolve.name_world_key(name);
-        self.src
-            .push_str(&format!("// Import functions from {name_raw}\n"));
+        // self.imports
+        //     .push_str(&format!("// Import functions from {name_raw}\n"));
 
-        let mut interface_generator = InterfaceGenerator {
-            resolve,
-            src: Source::default(),
-        };
+        let mut extern_decls = Vec::new();
         for (_name, func) in resolve.interfaces[iface].functions.iter() {
-            interface_generator.import(Some(name), func);
+            let (import_source, extern_decl) = import(resolve, name_raw, func);
+            self.imports.push_str(&import_source);
+            extern_decls.push(extern_decl);
         }
 
-        self.src.push_str(&interface_generator.src);
+        uwriteln!(self.imports, "const wasm_imports = struct {{");
+        for extern_decl in extern_decls {
+            self.imports.push_str(&extern_decl);
+            self.imports.push_str("\n");
+        }
+        uwriteln!(self.imports, "}};")
     }
 
     fn export_interface(
@@ -66,30 +71,43 @@ impl WorldGenerator for Zig {
     fn import_funcs(
         &mut self,
         resolve: &Resolve,
-        _world: WorldId,
+        world: WorldId,
         funcs: &[(&str, &Function)],
         _files: &mut Files,
     ) {
-        let mut interface_generator = InterfaceGenerator {
-            resolve,
-            src: Source::default(),
-        };
+        let mut extern_decls = Vec::new();
         for (_name, func) in funcs.iter() {
-            interface_generator.import(None, func);
+            let (import_source, extern_decl) = import(resolve, "$root", func);
+            self.imports.push_str(&import_source);
+            extern_decls.push(extern_decl);
         }
 
-        self.src.push_str(&interface_generator.src);
-        dbg!(self.src.as_mut_string());
+        uwriteln!(self.imports, "const wasm_imports = struct {{");
+        for extern_decl in extern_decls {
+            self.imports.push_str(&extern_decl);
+            self.imports.push_str("\n");
+        }
+        uwriteln!(self.imports, "}};")
     }
 
     fn export_funcs(
         &mut self,
-        _resolve: &Resolve,
-        _world: WorldId,
-        _funcs: &[(&str, &Function)],
+        resolve: &Resolve,
+        world: WorldId,
+        funcs: &[(&str, &Function)],
         _files: &mut Files,
     ) -> anyhow::Result<()> {
-        todo!()
+        let mut interface_generator = InterfaceGenerator {
+            resolve,
+            world,
+            src: Source::default(),
+        };
+        for (_name, func) in funcs.iter() {
+            interface_generator.export(None, func);
+        }
+
+        self.exports.push_str(&interface_generator.src);
+        Ok(())
     }
 
     fn import_types(
@@ -103,68 +121,96 @@ impl WorldGenerator for Zig {
     }
 
     fn finish(&mut self, resolve: &Resolve, world: WorldId, files: &mut Files) {
-        let file_name = &resolve.worlds[world].name.to_snake_case();
+        let file_name = format!("{}.zig", &resolve.worlds[world].name.to_snake_case());
 
-        files.push(&format!("{file_name}.zig"), self.src.as_bytes());
+        files.push(&file_name, b"const exports = @import(\"exports.zig\");\n\n");
+        files.push(&file_name, self.imports.as_bytes());
+        files.push(&file_name, b"\n");
+        files.push(&file_name, self.exports.as_bytes());
     }
 }
 
 struct InterfaceGenerator<'a> {
     resolve: &'a Resolve,
+    world: WorldId,
     src: Source,
 }
 
-impl<'a> InterfaceGenerator<'a> {
-    fn import(&mut self, interface_name: Option<&WorldKey>, func: &Function) {
-        let link_against = match interface_name {
-            Some(name) => self.resolve.name_world_key(name),
-            None => "$root".to_string(),
-        };
-        let sig = self.resolve.wasm_signature(AbiVariant::GuestImport, func);
-        let result_type = match sig.results.len() {
+fn import(resolve: &Resolve, library_name: &str, func: &Function) -> (Source, String) {
+    let extern_statement = get_extern_statement(resolve, library_name, func);
+
+    let mut src = Source::default();
+
+    let result_type = match &func.results {
+        Results::Named(params) => match params.len() {
             0 => "void",
-            1 => wasm_type_to_zig_type(sig.results[0]),
-            _ => unreachable!(),
+            _ => todo!(),
+        },
+        Results::Anon(t) => wit_type_to_zig_type(*t),
+    };
+    uwriteln!(
+        src,
+        "pub fn {}({}) {} {{",
+        func.name.to_snake_case(),
+        func.params
+            .iter()
+            .map(|(name, wit_type)| format!("{}: {}", name, wit_type_to_zig_type(*wit_type)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        result_type,
+    );
+
+    let mut func_bindgen = FunctionBindgen::new(resolve);
+    for (param_name, _param_type) in func.params.iter() {
+        func_bindgen.params.push(param_name.clone());
+    }
+    wit_bindgen_core::abi::call(
+        resolve,
+        AbiVariant::GuestImport,
+        LiftLower::LowerArgsLiftResults,
+        func,
+        &mut func_bindgen,
+    );
+    src.push_str(&func_bindgen.src);
+
+    uwriteln!(src, "}}");
+
+    (src, extern_statement)
+}
+
+impl<'a> InterfaceGenerator<'a> {
+    fn export(&mut self, interface_name: Option<&WorldKey>, func: &Function) {
+        let sig = self.resolve.wasm_signature(AbiVariant::GuestExport, func);
+
+        let result_type = match &func.results {
+            Results::Named(params) => match params.len() {
+                0 => "void",
+                _ => todo!(),
+            },
+            Results::Anon(t) => wit_type_to_zig_type(*t),
         };
         uwriteln!(
             self.src,
-            "extern \"{}\" fn @\"{}\"({}) {};",
-            link_against,
+            "export fn @\"{}\"({}) {} {{",
             func.name,
-            func.params
+            sig.params
                 .iter()
-                .map(|(name, _type)| name)
-                .zip(sig.params)
-                .map(|(name, wasm_type)| format!("{}: {}", name, wasm_type_to_zig_type(wasm_type)))
+                .enumerate()
+                .map(|(i, wasm_type)| format!("p{}: {}", i, wasm_type_to_zig_type(*wasm_type)))
                 .collect::<Vec<_>>()
                 .join(", "),
             result_type,
         );
 
-        let result_type = match func.results {
-            Results::Named(_) => todo!(),
-            Results::Anon(t) => wit_type_to_zig_type(t),
-        };
-        uwriteln!(
-            self.src,
-            "pub fn {}({}) {} {{",
-            func.name.to_snake_case(),
-            func.params
-                .iter()
-                .map(|(name, wit_type)| format!("{}: {}", name, wit_type_to_zig_type(*wit_type)))
-                .collect::<Vec<_>>()
-                .join(", "),
-            result_type,
-        );
-
-        let mut func_bindgen = FunctionBindgen::new(self.resolve, &func.name);
-        for (param_name, _param_type) in func.params.iter() {
-            func_bindgen.params.push(param_name.clone());
+        let mut func_bindgen = FunctionBindgen::new(self.resolve);
+        func_bindgen.export_name = Some("TestWorld".to_string());
+        for i in 0..sig.params.len() {
+            func_bindgen.params.push(format!("p{i}"));
         }
         wit_bindgen_core::abi::call(
             self.resolve,
-            AbiVariant::GuestImport,
-            LiftLower::LowerArgsLiftResults,
+            AbiVariant::GuestExport,
+            LiftLower::LiftArgsLowerResults,
             func,
             &mut func_bindgen,
         );
@@ -172,6 +218,27 @@ impl<'a> InterfaceGenerator<'a> {
 
         uwriteln!(self.src, "}}");
     }
+}
+
+fn get_extern_statement(resolve: &Resolve, library_name: &str, func: &Function) -> String {
+    let sig = resolve.wasm_signature(AbiVariant::GuestImport, func);
+    let result_type = match sig.results.len() {
+        0 => "void",
+        1 => wasm_type_to_zig_type(sig.results[0]),
+        _ => unreachable!(),
+    };
+    format!(
+        "extern \"{}\" fn @\"{}\"({}) {};",
+        library_name,
+        func.name,
+        sig.params
+            .iter()
+            .enumerate()
+            .map(|(i, wasm_type)| format!("p{}: {}", i, wasm_type_to_zig_type(*wasm_type)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        result_type,
+    )
 }
 
 fn wasm_type_to_zig_type(wasm_type: WasmType) -> &'static str {
@@ -188,7 +255,7 @@ fn wit_type_to_zig_type(wit_type: Type) -> &'static str {
         Type::Bool => todo!(),
         Type::U8 => todo!(),
         Type::U16 => todo!(),
-        Type::U32 => todo!(),
+        Type::U32 => "u32",
         Type::U64 => todo!(),
         Type::S8 => todo!(),
         Type::S16 => todo!(),
@@ -197,82 +264,32 @@ fn wit_type_to_zig_type(wit_type: Type) -> &'static str {
         Type::Float32 => todo!(),
         Type::Float64 => todo!(),
         Type::Char => todo!(),
-        Type::String => todo!(),
+        Type::String => "[]const u8",
         Type::Id(_) => todo!(),
     }
 }
 
-impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
-    fn resolve(&self) -> &'a Resolve {
-        todo!()
-    }
-
-    fn type_record(&mut self, id: TypeId, name: &str, record: &Record, docs: &Docs) {
-        todo!()
-    }
-
-    fn type_resource(&mut self, id: TypeId, name: &str, docs: &Docs) {
-        todo!()
-    }
-
-    fn type_flags(&mut self, id: TypeId, name: &str, flags: &Flags, docs: &Docs) {
-        todo!()
-    }
-
-    fn type_tuple(&mut self, id: TypeId, name: &str, flags: &Tuple, docs: &Docs) {
-        todo!()
-    }
-
-    fn type_variant(&mut self, id: TypeId, name: &str, variant: &Variant, docs: &Docs) {
-        todo!()
-    }
-
-    fn type_option(&mut self, id: TypeId, name: &str, payload: &Type, docs: &Docs) {
-        todo!()
-    }
-
-    fn type_result(&mut self, id: TypeId, name: &str, result: &Result_, docs: &Docs) {
-        todo!()
-    }
-
-    fn type_enum(&mut self, id: TypeId, name: &str, enum_: &Enum, docs: &Docs) {
-        todo!()
-    }
-
-    fn type_alias(&mut self, id: TypeId, name: &str, ty: &Type, docs: &Docs) {
-        todo!()
-    }
-
-    fn type_list(&mut self, id: TypeId, name: &str, ty: &Type, docs: &Docs) {
-        todo!()
-    }
-
-    fn type_builtin(&mut self, id: TypeId, name: &str, ty: &Type, docs: &Docs) {
-        todo!()
-    }
-}
-
-struct FunctionBindgen<'a> {
+struct FunctionBindgen {
     params: Vec<String>,
     src: Source,
     sizes: SizeAlign,
-    func_to_call: &'a str,
+    export_name: Option<String>,
 }
 
-impl FunctionBindgen<'_> {
-    fn new<'a>(resolve: &Resolve, func_to_call: &'a str) -> FunctionBindgen<'a> {
+impl FunctionBindgen {
+    fn new(resolve: &Resolve) -> FunctionBindgen {
         let mut sizes = SizeAlign::default();
         sizes.fill(resolve);
         FunctionBindgen {
             params: Vec::new(),
             src: Source::default(),
             sizes,
-            func_to_call,
+            export_name: None,
         }
     }
 }
 
-impl Bindgen for FunctionBindgen<'_> {
+impl Bindgen for FunctionBindgen {
     type Operand = String;
 
     fn emit(
@@ -284,10 +301,10 @@ impl Bindgen for FunctionBindgen<'_> {
     ) {
         match inst {
             Instruction::GetArg { nth } => results.push(self.params[*nth].clone()),
-            Instruction::StringLower { realloc } => {
+            Instruction::StringLower { realloc: _ } => {
                 let str = &operands[0];
-                results.push(format!("{str}.ptr"));
-                results.push(format!("{str}.len"));
+                results.push(format!("@as(i32, @intCast(@intFromPtr({str}.ptr)))"));
+                results.push(format!("@as(i32, @intCast({str}.len))"));
             }
             Instruction::CallWasm { name, sig } => {
                 match sig.results.len() {
@@ -301,12 +318,32 @@ impl Bindgen for FunctionBindgen<'_> {
 
                 uwriteln!(
                     self.src,
-                    "@\"{}\"({});",
-                    self.func_to_call,
+                    "wasm_imports.@\"{}\"({});",
+                    name,
                     operands.join(", ")
                 );
             }
-            Instruction::Return { amt, func } => {
+            Instruction::CallInterface { func } => {
+                match &func.results {
+                    Results::Named(params) => match params.len() {
+                        0 => {}
+                        _ => todo!(),
+                    },
+                    Results::Anon(_) => {
+                        self.src.push_str("const ret = ");
+                        results.push("ret".into());
+                    }
+                }
+
+                uwriteln!(
+                    self.src,
+                    "exports.{}.{}({});",
+                    self.export_name.clone().unwrap(),
+                    func.name.to_lower_camel_case(),
+                    operands.join(", ")
+                );
+            }
+            Instruction::Return { amt, func: _ } => {
                 assert!(*amt <= 1);
                 if *amt == 1 {
                     uwriteln!(self.src, "return {};", operands[0]);
@@ -315,6 +352,8 @@ impl Bindgen for FunctionBindgen<'_> {
             Instruction::I32FromS32 | Instruction::S32FromI32 => {
                 results.push(operands[0].clone());
             }
+            Instruction::I32FromU32 => results.push(format!("@as(i32, @intCast({}))", operands[0])),
+            Instruction::U32FromI32 => results.push(format!("@as(u32, @intCast({}))", operands[0])),
             _ => todo!("{inst:?}"),
         }
     }
