@@ -1,12 +1,12 @@
-use std::fmt::Write;
+use std::fmt::{Debug, Write};
 
-use heck::{ToLowerCamelCase, ToSnakeCase, ToUpperCamelCase};
+use heck::{ToLowerCamelCase, ToSnakeCase};
 use wit_bindgen_core::{
     abi::{AbiVariant, Bindgen, Instruction, LiftLower, WasmType},
     uwriteln,
     wit_parser::{
-        Docs, Enum, Flags, Function, InterfaceId, Record, Resolve, Result_, Results, SizeAlign,
-        Tuple, Type, TypeId, Variant, WorldId, WorldKey,
+        Function, InterfaceId, Resolve, Results, SizeAlign, Type, TypeDefKind, TypeId, WorldId,
+        WorldKey,
     },
     Files, Source, WorldGenerator,
 };
@@ -40,11 +40,19 @@ impl WorldGenerator for Zig {
         _files: &mut Files,
     ) {
         let name_raw = &resolve.name_world_key(name);
-        // self.imports
-        //     .push_str(&format!("// Import functions from {name_raw}\n"));
+        self.imports
+            .push_str(&format!("// Import functions from {name_raw}\n"));
+
+        let interface = &resolve.interfaces[iface];
+
+        uwriteln!(
+            self.imports,
+            "pub const {} = struct {{",
+            interface.name.as_ref().unwrap()
+        );
 
         let mut extern_decls = Vec::new();
-        for (_name, func) in resolve.interfaces[iface].functions.iter() {
+        for (_name, func) in interface.functions.iter() {
             let (import_source, extern_decl) = import(resolve, name_raw, func);
             self.imports.push_str(&import_source);
             extern_decls.push(extern_decl);
@@ -55,23 +63,35 @@ impl WorldGenerator for Zig {
             self.imports.push_str(&extern_decl);
             self.imports.push_str("\n");
         }
-        uwriteln!(self.imports, "}};")
+        uwriteln!(self.imports, "}};");
+        uwriteln!(self.imports, "}};");
     }
 
     fn export_interface(
         &mut self,
-        _resolve: &Resolve,
+        resolve: &Resolve,
         _name: &WorldKey,
-        _iface: InterfaceId,
+        iface: InterfaceId,
         _files: &mut Files,
     ) -> anyhow::Result<()> {
-        todo!()
+        let interface = &resolve.interfaces[iface];
+
+        uwriteln!(
+            self.exports,
+            "pub const {} = struct {{",
+            interface.name.as_ref().unwrap()
+        );
+        for (_name, func) in interface.functions.iter() {
+            self.exports.push_str(&export(resolve, func));
+        }
+        uwriteln!(self.exports, "}};");
+        Ok(())
     }
 
     fn import_funcs(
         &mut self,
         resolve: &Resolve,
-        world: WorldId,
+        _world: WorldId,
         funcs: &[(&str, &Function)],
         _files: &mut Files,
     ) {
@@ -93,20 +113,13 @@ impl WorldGenerator for Zig {
     fn export_funcs(
         &mut self,
         resolve: &Resolve,
-        world: WorldId,
+        _world: WorldId,
         funcs: &[(&str, &Function)],
         _files: &mut Files,
     ) -> anyhow::Result<()> {
-        let mut interface_generator = InterfaceGenerator {
-            resolve,
-            world,
-            src: Source::default(),
-        };
         for (_name, func) in funcs.iter() {
-            interface_generator.export(None, func);
+            self.exports.push_str(&export(resolve, func));
         }
-
-        self.exports.push_str(&interface_generator.src);
         Ok(())
     }
 
@@ -123,17 +136,16 @@ impl WorldGenerator for Zig {
     fn finish(&mut self, resolve: &Resolve, world: WorldId, files: &mut Files) {
         let file_name = format!("{}.zig", &resolve.worlds[world].name.to_snake_case());
 
-        files.push(&file_name, b"const exports = @import(\"exports.zig\");\n\n");
         files.push(&file_name, self.imports.as_bytes());
         files.push(&file_name, b"\n");
-        files.push(&file_name, self.exports.as_bytes());
-    }
-}
 
-struct InterfaceGenerator<'a> {
-    resolve: &'a Resolve,
-    world: WorldId,
-    src: Source,
+        let mut exports = Source::default();
+        exports.push_str("pub const exports = struct {\n");
+        exports.push_str("const __user_exports = @import(\"exports.zig\");\n\n");
+        exports.push_str(&self.exports);
+        exports.push_str("};");
+        files.push(&file_name, exports.as_bytes());
+    }
 }
 
 fn import(resolve: &Resolve, library_name: &str, func: &Function) -> (Source, String) {
@@ -143,10 +155,10 @@ fn import(resolve: &Resolve, library_name: &str, func: &Function) -> (Source, St
 
     let result_type = match &func.results {
         Results::Named(params) => match params.len() {
-            0 => "void",
+            0 => "void".to_owned(),
             _ => todo!(),
         },
-        Results::Anon(t) => wit_type_to_zig_type(*t),
+        Results::Anon(t) => wit_type_to_zig_type(resolve, *t),
     };
     uwriteln!(
         src,
@@ -154,7 +166,11 @@ fn import(resolve: &Resolve, library_name: &str, func: &Function) -> (Source, St
         func.name.to_snake_case(),
         func.params
             .iter()
-            .map(|(name, wit_type)| format!("{}: {}", name, wit_type_to_zig_type(*wit_type)))
+            .map(|(name, wit_type)| format!(
+                "{}: {}",
+                name,
+                wit_type_to_zig_type(resolve, *wit_type)
+            ))
             .collect::<Vec<_>>()
             .join(", "),
         result_type,
@@ -178,46 +194,45 @@ fn import(resolve: &Resolve, library_name: &str, func: &Function) -> (Source, St
     (src, extern_statement)
 }
 
-impl<'a> InterfaceGenerator<'a> {
-    fn export(&mut self, interface_name: Option<&WorldKey>, func: &Function) {
-        let sig = self.resolve.wasm_signature(AbiVariant::GuestExport, func);
+fn export(resolve: &Resolve, func: &Function) -> Source {
+    let sig = resolve.wasm_signature(AbiVariant::GuestExport, func);
 
-        let result_type = match &func.results {
-            Results::Named(params) => match params.len() {
-                0 => "void",
-                _ => todo!(),
-            },
-            Results::Anon(t) => wit_type_to_zig_type(*t),
-        };
-        uwriteln!(
-            self.src,
-            "export fn @\"{}\"({}) {} {{",
-            func.name,
-            sig.params
-                .iter()
-                .enumerate()
-                .map(|(i, wasm_type)| format!("p{}: {}", i, wasm_type_to_zig_type(*wasm_type)))
-                .collect::<Vec<_>>()
-                .join(", "),
-            result_type,
-        );
+    let mut src = Source::default();
 
-        let mut func_bindgen = FunctionBindgen::new(self.resolve);
-        func_bindgen.export_name = Some("TestWorld".to_string());
-        for i in 0..sig.params.len() {
-            func_bindgen.params.push(format!("p{i}"));
-        }
-        wit_bindgen_core::abi::call(
-            self.resolve,
-            AbiVariant::GuestExport,
-            LiftLower::LiftArgsLowerResults,
-            func,
-            &mut func_bindgen,
-        );
-        self.src.push_str(&func_bindgen.src);
+    let result_type = match &sig.results.len() {
+        0 => "void",
+        1 => wasm_type_to_zig_type(sig.results[0]),
+        _ => todo!(),
+    };
+    uwriteln!(
+        src,
+        "export fn @\"{}\"({}) {} {{",
+        func.name,
+        sig.params
+            .iter()
+            .enumerate()
+            .map(|(i, wasm_type)| format!("p{}: {}", i, wasm_type_to_zig_type(*wasm_type)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        result_type,
+    );
 
-        uwriteln!(self.src, "}}");
+    let mut func_bindgen = FunctionBindgen::new(resolve);
+    func_bindgen.export_name = Some("TestWorld".to_string());
+    for i in 0..sig.params.len() {
+        func_bindgen.params.push(format!("p{i}"));
     }
+    wit_bindgen_core::abi::call(
+        resolve,
+        AbiVariant::GuestExport,
+        LiftLower::LiftArgsLowerResults,
+        func,
+        &mut func_bindgen,
+    );
+    src.push_str(&func_bindgen.src);
+
+    uwriteln!(src, "}}");
+    src
 }
 
 fn get_extern_statement(resolve: &Resolve, library_name: &str, func: &Function) -> String {
@@ -250,22 +265,49 @@ fn wasm_type_to_zig_type(wasm_type: WasmType) -> &'static str {
     }
 }
 
-fn wit_type_to_zig_type(wit_type: Type) -> &'static str {
+fn wit_type_to_zig_type(resolve: &Resolve, wit_type: Type) -> String {
     match wit_type {
         Type::Bool => todo!(),
-        Type::U8 => todo!(),
-        Type::U16 => todo!(),
-        Type::U32 => "u32",
-        Type::U64 => todo!(),
-        Type::S8 => todo!(),
-        Type::S16 => todo!(),
-        Type::S32 => "i32",
-        Type::S64 => todo!(),
-        Type::Float32 => todo!(),
-        Type::Float64 => todo!(),
+        Type::U8 => "u8".to_owned(),
+        Type::U16 => "u16".to_owned(),
+        Type::U32 => "u32".to_owned(),
+        Type::U64 => "u64".to_owned(),
+        Type::S8 => "i8".to_owned(),
+        Type::S16 => "i16".to_owned(),
+        Type::S32 => "i32".to_owned(),
+        Type::S64 => "i64".to_owned(),
+        Type::Float32 => "f32".to_owned(),
+        Type::Float64 => "f64".to_owned(),
         Type::Char => todo!(),
-        Type::String => "[]const u8",
-        Type::Id(_) => todo!(),
+        Type::String => "[]const u8".to_owned(),
+        Type::Id(id) => {
+            let ty = &resolve.types[id];
+            match &ty.kind {
+                TypeDefKind::Record(_) => todo!(),
+                TypeDefKind::Resource => todo!(),
+                TypeDefKind::Handle(_) => todo!(),
+                TypeDefKind::Flags(_) => todo!(),
+                TypeDefKind::Tuple(t) => {
+                    format!(
+                        "struct{{ {} }}",
+                        t.types
+                            .iter()
+                            .map(|t| wit_type_to_zig_type(resolve, *t))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+                TypeDefKind::Variant(_) => todo!(),
+                TypeDefKind::Enum(_) => todo!(),
+                TypeDefKind::Option(_) => todo!(),
+                TypeDefKind::Result(_) => todo!(),
+                TypeDefKind::List(_) => todo!(),
+                TypeDefKind::Future(_) => todo!(),
+                TypeDefKind::Stream(_) => todo!(),
+                TypeDefKind::Type(_) => todo!(),
+                TypeDefKind::Unknown => todo!(),
+            }
+        }
     }
 }
 
@@ -294,7 +336,7 @@ impl Bindgen for FunctionBindgen {
 
     fn emit(
         &mut self,
-        resolve: &Resolve,
+        _resolve: &Resolve,
         inst: &Instruction<'_>,
         operands: &mut Vec<Self::Operand>,
         results: &mut Vec<Self::Operand>,
@@ -337,7 +379,7 @@ impl Bindgen for FunctionBindgen {
 
                 uwriteln!(
                     self.src,
-                    "exports.{}.{}({});",
+                    "__user_exports.{}.{}({});",
                     self.export_name.clone().unwrap(),
                     func.name.to_lower_camel_case(),
                     operands.join(", ")
@@ -349,17 +391,101 @@ impl Bindgen for FunctionBindgen {
                     uwriteln!(self.src, "return {};", operands[0]);
                 }
             }
-            Instruction::I32FromS32 | Instruction::S32FromI32 => {
+            Instruction::I32FromS32
+            | Instruction::S32FromI32
+            | Instruction::I64FromS64
+            | Instruction::S64FromI64
+            | Instruction::F32FromFloat32
+            | Instruction::F64FromFloat64
+            | Instruction::Float32FromF32
+            | Instruction::Float64FromF64 => {
                 results.push(operands[0].clone());
             }
-            Instruction::I32FromU32 => results.push(format!("@as(i32, @intCast({}))", operands[0])),
+            Instruction::I32FromU8
+            | Instruction::I32FromU16
+            | Instruction::I32FromU32
+            | Instruction::I32FromS8
+            | Instruction::I32FromS16 => {
+                results.push(format!("@as(i32, @intCast({}))", operands[0]))
+            }
+            Instruction::I64FromU64 => results.push(format!("@as(i64, @intCast({}))", operands[0])),
+            Instruction::S8FromI32 => results.push(format!("@as(i8, @intCast({}))", operands[0])),
+            Instruction::U8FromI32 => results.push(format!("@as(u8, @intCast({}))", operands[0])),
+            Instruction::S16FromI32 => results.push(format!("@as(i16, @intCast({}))", operands[0])),
+            Instruction::U16FromI32 => results.push(format!("@as(u16, @intCast({}))", operands[0])),
             Instruction::U32FromI32 => results.push(format!("@as(u32, @intCast({}))", operands[0])),
+            Instruction::U64FromI64 => results.push(format!("@as(u64, @intCast({}))", operands[0])),
+
+            Instruction::I32Load8U { offset } => {
+                uwriteln!(
+                    self.src,
+                    "const tmp = @as(i32, @intCast(@as(*const u8, @ptrFromInt({} + {})).*));",
+                    operands[0],
+                    offset,
+                );
+                results.push("tmp".to_owned());
+            }
+            Instruction::I64Load { offset } => {
+                uwriteln!(
+                    self.src,
+                    "const tmp = @as(*const i64, @ptrFromInt({} + {})).*;",
+                    operands[0],
+                    offset,
+                );
+                results.push("tmp".to_owned());
+            }
+
+            Instruction::I32Store { offset } => {
+                uwriteln!(
+                    self.src,
+                    "@as(*i32, @ptrFromInt({} + {})).* = {};",
+                    operands[1],
+                    offset,
+                    operands[0]
+                );
+            }
+            Instruction::I32Store8 { offset } => {
+                uwriteln!(
+                    self.src,
+                    "@as(*u8, @ptrFromInt({} + {})).* = @as(u8, @intCast({}));",
+                    operands[1],
+                    offset,
+                    operands[0]
+                );
+            }
+            Instruction::I32Store16 { offset } => {
+                uwriteln!(
+                    self.src,
+                    "@as(*u16, @ptrFromInt({} + {})).* = @as(u16, @intCast({}));",
+                    operands[1],
+                    offset,
+                    operands[0]
+                );
+            }
+            Instruction::I64Store { offset } => {
+                uwriteln!(
+                    self.src,
+                    "@as(*i64, @ptrFromInt({} + {})).* = {};",
+                    operands[1],
+                    offset,
+                    operands[0]
+                );
+            }
+
+            Instruction::TupleLift { .. } => {
+                results.push(format!(".{{ {} }}", operands.join(", ")))
+            }
+            Instruction::TupleLower { tuple, .. } => {
+                for result in (0..tuple.types.len()).map(|i| format!("{}{}", operands[0], i)) {
+                    results.push(result);
+                }
+            }
             _ => todo!("{inst:?}"),
         }
     }
 
     fn return_pointer(&mut self, _size: usize, _align: usize) -> Self::Operand {
-        todo!()
+        "ptr0".to_string()
     }
 
     fn push_block(&mut self) {
