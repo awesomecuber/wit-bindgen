@@ -97,6 +97,7 @@ fn tests(name: &str, dir_name: &str) -> Result<Vec<PathBuf>> {
     let mut c = Vec::new();
     let mut java = Vec::new();
     let mut go = Vec::new();
+    let mut zig = Vec::new();
     for file in dir.read_dir()? {
         let path = file?.path();
         match path.extension().and_then(|s| s.to_str()) {
@@ -104,6 +105,7 @@ fn tests(name: &str, dir_name: &str) -> Result<Vec<PathBuf>> {
             Some("java") => java.push(path),
             Some("rs") => rust.push(path),
             Some("go") => go.push(path),
+            Some("zig") => zig.push(path),
             _ => {}
         }
     }
@@ -448,6 +450,86 @@ fn tests(name: &str, dir_name: &str) -> Result<Vec<PathBuf>> {
             ));
         let component_path =
             out_dir.join("target/generated/wasm/teavm-wasm/classes.component.wasm");
+        fs::write(&component_path, component).expect("write component to disk");
+
+        result.push(component_path);
+    }
+
+    #[cfg(feature = "zig")]
+    if !zig.is_empty() {
+        let world_name = &resolve.worlds[world].name;
+        let out_dir = out_dir.join(format!("zig-{}", world_name));
+        drop(fs::remove_dir_all(&out_dir));
+
+        let snake = world_name.replace("-", "_");
+        let mut files = Default::default();
+        let mut opts = wit_bindgen_zig::Opts::default();
+        opts.exports_file = Some("main.zig".into());
+        opts.build().generate(&resolve, world, &mut files).unwrap();
+
+        fs::create_dir_all(&out_dir).unwrap();
+        let (generated_file, contents) = files.iter().next().unwrap();
+        let dst = out_dir.join(generated_file);
+        fs::write(dst, contents).unwrap();
+
+        for zig_impl in &zig {
+            fs::copy(zig_impl, out_dir.join(format!("main.zig"))).unwrap();
+        }
+
+        let mut cmd = Command::new("zig");
+        cmd.arg("build-lib");
+        cmd.arg(format!("{generated_file}"));
+        cmd.args([
+            "-target",
+            "wasm32-wasi",
+            "-dynamic",
+            "-rdynamic",
+            "-O",
+            "ReleaseFast",
+        ]);
+        cmd.current_dir(&out_dir);
+
+        let out_wasm = out_dir.join(format!("{snake}.wasm"));
+
+        println!("{:?}", cmd);
+        let output = match cmd.output() {
+            Ok(output) => output,
+            Err(e) => panic!("failed to spawn compiler: {}", e),
+        };
+
+        if !output.status.success() {
+            println!("status: {}", output.status);
+            println!("stdout: ------------------------------------------");
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            println!("stderr: ------------------------------------------");
+            println!("{}", String::from_utf8_lossy(&output.stderr));
+            panic!("failed to compile");
+        }
+
+        // Translate the canonical ABI module into a component.
+        let mut module = fs::read(&out_wasm).expect("failed to read wasm file");
+
+        let encoded = wit_component::metadata::encode(&resolve, world, StringEncoding::UTF8, None)?;
+
+        let section = wasm_encoder::CustomSection {
+            name: Cow::Borrowed("component-type"),
+            data: Cow::Borrowed(&encoded),
+        };
+        module.push(section.id());
+        section.encode(&mut module);
+
+        let component = ComponentEncoder::default()
+            .module(module.as_slice())
+            .expect("pull custom sections from module")
+            .validate(true)
+            .adapter("wasi_snapshot_preview1", &wasi_adapter)
+            .expect("adapter failed to get loaded")
+            .encode()
+            .expect(&format!(
+                "module {:?} can be translated to a component",
+                out_wasm
+            ));
+        let component_path = out_wasm.with_extension("component.wasm");
         fs::write(&component_path, component).expect("write component to disk");
 
         result.push(component_path);

@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::{path::Path, process::Command};
+
+use heck::ToSnakeCase;
 
 macro_rules! codegen_test {
     ($id:ident $name:tt $test:tt) => {
@@ -21,4 +23,11 @@ macro_rules! codegen_test {
 
 test_helpers::codegen_tests!();
 
-fn verify(_dir: &Path, _name: &str) {}
+fn verify(dir: &Path, name: &str) {
+    let mut cmd = Command::new("zig");
+    cmd.arg("build-lib");
+    cmd.arg(format!("{}.zig", name.to_snake_case()));
+    cmd.args(["-target", "wasm32-wasi", "-dynamic", "-rdynamic"]);
+    cmd.current_dir(dir);
+    test_helpers::run_command(&mut cmd);
+}

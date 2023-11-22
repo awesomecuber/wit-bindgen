@@ -2,7 +2,7 @@ use std::fmt::{Debug, Write};
 
 use heck::{ToLowerCamelCase, ToSnakeCase};
 use wit_bindgen_core::{
-    abi::{AbiVariant, Bindgen, Instruction, LiftLower, WasmType},
+    abi::{AbiVariant, Bindgen, Instruction, LiftLower, WasmSignature, WasmType},
     uwriteln,
     wit_parser::{
         Function, InterfaceId, Resolve, Results, SizeAlign, Type, TypeDefKind, TypeId, WorldId,
@@ -13,12 +13,16 @@ use wit_bindgen_core::{
 
 #[derive(Default, Debug, Clone)]
 #[cfg_attr(feature = "clap", derive(clap::Args))]
-pub struct Opts {}
+pub struct Opts {
+    /// The file to where exports are defined. If this is not specified, mocks are created in the generated files.
+    #[cfg_attr(feature = "clap", arg(long))]
+    pub exports_file: Option<String>,
+}
 
 impl Opts {
     pub fn build(&self) -> Box<dyn WorldGenerator> {
         Box::new(Zig {
-            _opts: self.clone(),
+            opts: self.clone(),
             ..Zig::default()
         })
     }
@@ -26,9 +30,16 @@ impl Opts {
 
 #[derive(Default)]
 pub struct Zig {
-    _opts: Opts,
+    opts: Opts,
     imports: Source,
     exports: Source,
+}
+
+fn valid_zig_identifier(s: &str) -> &str {
+    match s {
+        "test" => "@\"test\"",
+        _ => s,
+    }
 }
 
 impl WorldGenerator for Zig {
@@ -40,51 +51,50 @@ impl WorldGenerator for Zig {
         _files: &mut Files,
     ) {
         let name_raw = &resolve.name_world_key(name);
-        self.imports
-            .push_str(&format!("// Import functions from {name_raw}\n"));
 
         let interface = &resolve.interfaces[iface];
+
+        let struct_name = match name {
+            WorldKey::Name(name) => name,
+            WorldKey::Interface(_) => interface.name.as_ref().unwrap(),
+        };
 
         uwriteln!(
             self.imports,
             "pub const {} = struct {{",
-            interface.name.as_ref().unwrap()
+            valid_zig_identifier(struct_name),
         );
 
-        let mut extern_decls = Vec::new();
         for (_name, func) in interface.functions.iter() {
-            let (import_source, extern_decl) = import(resolve, name_raw, func);
+            let import_source = import(resolve, name_raw, func);
             self.imports.push_str(&import_source);
-            extern_decls.push(extern_decl);
         }
 
-        uwriteln!(self.imports, "const wasm_imports = struct {{");
-        for extern_decl in extern_decls {
-            self.imports.push_str(&extern_decl);
-            self.imports.push_str("\n");
-        }
-        uwriteln!(self.imports, "}};");
         uwriteln!(self.imports, "}};");
     }
 
     fn export_interface(
         &mut self,
         resolve: &Resolve,
-        _name: &WorldKey,
+        name: &WorldKey,
         iface: InterfaceId,
         _files: &mut Files,
     ) -> anyhow::Result<()> {
-        let interface = &resolve.interfaces[iface];
+        let name_raw = &resolve.name_world_key(name);
 
-        uwriteln!(
-            self.exports,
-            "pub const {} = struct {{",
-            interface.name.as_ref().unwrap()
-        );
+        let interface = &resolve.interfaces[iface];
+        let struct_name = match name {
+            WorldKey::Name(name) => name,
+            WorldKey::Interface(_) => interface.name.as_ref().unwrap(),
+        };
+
+        uwriteln!(self.exports, "pub const {} = struct {{", struct_name);
         for (_name, func) in interface.functions.iter() {
-            self.exports.push_str(&export(resolve, func));
+            self.exports
+                .push_str(&export(resolve, Some(name_raw), func));
         }
         uwriteln!(self.exports, "}};");
+
         Ok(())
     }
 
@@ -95,19 +105,10 @@ impl WorldGenerator for Zig {
         funcs: &[(&str, &Function)],
         _files: &mut Files,
     ) {
-        let mut extern_decls = Vec::new();
         for (_name, func) in funcs.iter() {
-            let (import_source, extern_decl) = import(resolve, "$root", func);
+            let import_source = import(resolve, "$root", func);
             self.imports.push_str(&import_source);
-            extern_decls.push(extern_decl);
         }
-
-        uwriteln!(self.imports, "const wasm_imports = struct {{");
-        for extern_decl in extern_decls {
-            self.imports.push_str(&extern_decl);
-            self.imports.push_str("\n");
-        }
-        uwriteln!(self.imports, "}};")
     }
 
     fn export_funcs(
@@ -118,7 +119,7 @@ impl WorldGenerator for Zig {
         _files: &mut Files,
     ) -> anyhow::Result<()> {
         for (_name, func) in funcs.iter() {
-            self.exports.push_str(&export(resolve, func));
+            self.exports.push_str(&export(resolve, None, func));
         }
         Ok(())
     }
@@ -141,16 +142,24 @@ impl WorldGenerator for Zig {
 
         let mut exports = Source::default();
         exports.push_str("pub const exports = struct {\n");
-        exports.push_str("const __user_exports = @import(\"exports.zig\");\n\n");
+        match &self.opts.exports_file {
+            Some(exports_file) => uwriteln!(
+                exports,
+                "const __user_exports = @import(\"{}\");\n\n",
+                exports_file,
+            ),
+            None => uwriteln!(exports, "const __user_exports = stubs;\n\n"),
+        }
         exports.push_str(&self.exports);
-        exports.push_str("};");
+        exports.push_str("};\n\n");
+
+        exports.push_str("comptime {\n_ = exports;\n}\n");
+
         files.push(&file_name, exports.as_bytes());
     }
 }
 
-fn import(resolve: &Resolve, library_name: &str, func: &Function) -> (Source, String) {
-    let extern_statement = get_extern_statement(resolve, library_name, func);
-
+fn import(resolve: &Resolve, library_name: &str, func: &Function) -> Source {
     let mut src = Source::default();
 
     let result_type = match &func.results {
@@ -176,7 +185,7 @@ fn import(resolve: &Resolve, library_name: &str, func: &Function) -> (Source, St
         result_type,
     );
 
-    let mut func_bindgen = FunctionBindgen::new(resolve);
+    let mut func_bindgen = FunctionBindgen::new(resolve, Some(library_name));
     for (param_name, _param_type) in func.params.iter() {
         func_bindgen.params.push(param_name.clone());
     }
@@ -191,13 +200,18 @@ fn import(resolve: &Resolve, library_name: &str, func: &Function) -> (Source, St
 
     uwriteln!(src, "}}");
 
-    (src, extern_statement)
+    src
 }
 
-fn export(resolve: &Resolve, func: &Function) -> Source {
+fn export(resolve: &Resolve, interface_name: Option<&str>, func: &Function) -> Source {
     let sig = resolve.wasm_signature(AbiVariant::GuestExport, func);
 
     let mut src = Source::default();
+
+    let export_func_name = match interface_name {
+        Some(i) => format!("{}#{}", i, func.name),
+        None => func.name.clone(),
+    };
 
     let result_type = match &sig.results.len() {
         0 => "void",
@@ -207,7 +221,7 @@ fn export(resolve: &Resolve, func: &Function) -> Source {
     uwriteln!(
         src,
         "export fn @\"{}\"({}) {} {{",
-        func.name,
+        export_func_name,
         sig.params
             .iter()
             .enumerate()
@@ -217,7 +231,7 @@ fn export(resolve: &Resolve, func: &Function) -> Source {
         result_type,
     );
 
-    let mut func_bindgen = FunctionBindgen::new(resolve);
+    let mut func_bindgen = FunctionBindgen::new(resolve, None);
     func_bindgen.export_name = Some("TestWorld".to_string());
     for i in 0..sig.params.len() {
         func_bindgen.params.push(format!("p{i}"));
@@ -235,8 +249,7 @@ fn export(resolve: &Resolve, func: &Function) -> Source {
     src
 }
 
-fn get_extern_statement(resolve: &Resolve, library_name: &str, func: &Function) -> String {
-    let sig = resolve.wasm_signature(AbiVariant::GuestImport, func);
+fn get_extern_statement(sig: &WasmSignature, library_name: &str, func_name: &str) -> String {
     let result_type = match sig.results.len() {
         0 => "void",
         1 => wasm_type_to_zig_type(sig.results[0]),
@@ -245,11 +258,10 @@ fn get_extern_statement(resolve: &Resolve, library_name: &str, func: &Function) 
     format!(
         "extern \"{}\" fn @\"{}\"({}) {};",
         library_name,
-        func.name,
+        func_name,
         sig.params
             .iter()
-            .enumerate()
-            .map(|(i, wasm_type)| format!("p{}: {}", i, wasm_type_to_zig_type(*wasm_type)))
+            .map(|wasm_type| wasm_type_to_zig_type(*wasm_type))
             .collect::<Vec<_>>()
             .join(", "),
         result_type,
@@ -278,7 +290,7 @@ fn wit_type_to_zig_type(resolve: &Resolve, wit_type: Type) -> String {
         Type::S64 => "i64".to_owned(),
         Type::Float32 => "f32".to_owned(),
         Type::Float64 => "f64".to_owned(),
-        Type::Char => todo!(),
+        Type::Char => "u32".to_owned(),
         Type::String => "[]const u8".to_owned(),
         Type::Id(id) => {
             let ty = &resolve.types[id];
@@ -311,15 +323,16 @@ fn wit_type_to_zig_type(resolve: &Resolve, wit_type: Type) -> String {
     }
 }
 
-struct FunctionBindgen {
+struct FunctionBindgen<'a> {
     params: Vec<String>,
     src: Source,
     sizes: SizeAlign,
     export_name: Option<String>,
+    wasm_import_module: Option<&'a str>,
 }
 
-impl FunctionBindgen {
-    fn new(resolve: &Resolve) -> FunctionBindgen {
+impl<'a> FunctionBindgen<'a> {
+    fn new(resolve: &Resolve, wasm_import_module: Option<&'a str>) -> FunctionBindgen<'a> {
         let mut sizes = SizeAlign::default();
         sizes.fill(resolve);
         FunctionBindgen {
@@ -327,11 +340,12 @@ impl FunctionBindgen {
             src: Source::default(),
             sizes,
             export_name: None,
+            wasm_import_module,
         }
     }
 }
 
-impl Bindgen for FunctionBindgen {
+impl Bindgen for FunctionBindgen<'_> {
     type Operand = String;
 
     fn emit(
@@ -358,11 +372,15 @@ impl Bindgen for FunctionBindgen {
                     _ => unimplemented!(),
                 }
 
+                let extern_statement =
+                    get_extern_statement(sig, self.wasm_import_module.unwrap(), name);
+
                 uwriteln!(
                     self.src,
-                    "wasm_imports.@\"{}\"({});",
+                    "(struct {{\n{}\n}}).@\"{}\"({});",
+                    extern_statement,
                     name,
-                    operands.join(", ")
+                    operands.join(", "),
                 );
             }
             Instruction::CallInterface { func } => {
@@ -405,7 +423,8 @@ impl Bindgen for FunctionBindgen {
             | Instruction::I32FromU16
             | Instruction::I32FromU32
             | Instruction::I32FromS8
-            | Instruction::I32FromS16 => {
+            | Instruction::I32FromS16
+            | Instruction::I32FromChar => {
                 results.push(format!("@as(i32, @intCast({}))", operands[0]))
             }
             Instruction::I64FromU64 => results.push(format!("@as(i64, @intCast({}))", operands[0])),
@@ -413,7 +432,9 @@ impl Bindgen for FunctionBindgen {
             Instruction::U8FromI32 => results.push(format!("@as(u8, @intCast({}))", operands[0])),
             Instruction::S16FromI32 => results.push(format!("@as(i16, @intCast({}))", operands[0])),
             Instruction::U16FromI32 => results.push(format!("@as(u16, @intCast({}))", operands[0])),
-            Instruction::U32FromI32 => results.push(format!("@as(u32, @intCast({}))", operands[0])),
+            Instruction::U32FromI32 | Instruction::CharFromI32 => {
+                results.push(format!("@as(u32, @intCast({}))", operands[0]))
+            }
             Instruction::U64FromI64 => results.push(format!("@as(u64, @intCast({}))", operands[0])),
 
             Instruction::I32Load8U { offset } => {

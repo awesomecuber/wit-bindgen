@@ -55,7 +55,7 @@ enum Opt {
         #[clap(flatten)]
         args: Common,
     },
-    /// Generates bindings for TinyGo-based Go guest modules.
+    /// Generates bindings for Zig guest modules.
     #[cfg(feature = "zig")]
     Zig {
         #[clap(flatten)]
