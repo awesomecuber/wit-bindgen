@@ -1,7 +1,5 @@
 const smoke = @import("smoke.zig");
 
-pub const TestWorld = struct {
-    pub fn thunk() void {
-        smoke.imports.thunk();
-    }
-};
+pub fn thunk() void {
+    smoke.test_.smoke.imports.thunk();
+}

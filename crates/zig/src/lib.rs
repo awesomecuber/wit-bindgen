@@ -1,4 +1,7 @@
-use std::fmt::{Debug, Write};
+use std::{
+    collections::BTreeMap,
+    fmt::{Debug, Write},
+};
 
 use heck::{ToLowerCamelCase, ToSnakeCase};
 use wit_bindgen_core::{
@@ -28,17 +31,96 @@ impl Opts {
     }
 }
 
+struct ScopedSource {
+    scope: Vec<String>,
+    src: Source,
+}
+
+fn get_path(resolve: &Resolve, name: &WorldKey) -> Vec<String> {
+    let mut path = Vec::new();
+    match name {
+        WorldKey::Name(name) => {
+            path.push(to_zig_ident(name));
+        }
+        WorldKey::Interface(id) => {
+            let iface = &resolve.interfaces[*id];
+            let pkg = iface.package.unwrap();
+            let pkgname = resolve.packages[pkg].name.clone();
+            path.push(to_zig_ident(&pkgname.namespace));
+            path.push(to_zig_ident(&pkgname.name));
+            path.push(to_zig_ident(resolve.interfaces[*id].name.as_ref().unwrap()));
+        }
+    };
+    path
+}
+
+#[derive(Default)]
+struct ScopedSources(Vec<ScopedSource>);
+
+impl ScopedSources {
+    fn push(&mut self, resolve: &Resolve, name: &WorldKey, src: Source) {
+        self.0.push(ScopedSource {
+            scope: get_path(resolve, name),
+            src,
+        });
+    }
+
+    fn push_flat(&mut self, src: Source) {
+        self.0.push(ScopedSource { scope: vec![], src })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn get_source(&mut self) -> Source {
+        #[derive(Default)]
+        struct Module {
+            submodules: BTreeMap<String, Module>,
+            contents: Vec<Source>,
+        }
+
+        let scoped_sources = std::mem::take(self);
+
+        let mut map = Module::default();
+        for ScopedSource { scope, src } in scoped_sources.0 {
+            let mut cur = &mut map;
+            for name in scope.iter() {
+                cur = cur
+                    .submodules
+                    .entry(name.clone())
+                    .or_insert(Module::default());
+            }
+            cur.contents.push(src);
+        }
+        let mut src = Source::default();
+        emit(&mut src, map);
+        return src;
+
+        fn emit(me: &mut Source, module: Module) {
+            for content in module.contents {
+                me.push_str(&content);
+            }
+            for (name, submodule) in module.submodules {
+                uwriteln!(me, "pub const {name} = struct {{");
+                emit(me, submodule);
+                uwriteln!(me, "}};");
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Zig {
     opts: Opts,
-    imports: Source,
-    exports: Source,
+    import_scopes: ScopedSources,
+    export_scopes: ScopedSources,
 }
 
-fn valid_zig_identifier(s: &str) -> &str {
+fn to_zig_ident(s: &str) -> String {
     match s {
-        "test" => "@\"test\"",
-        _ => s,
+        "test" => "test_".into(),
+        _ => s.to_snake_case(),
     }
 }
 
@@ -50,27 +132,11 @@ impl WorldGenerator for Zig {
         iface: InterfaceId,
         _files: &mut Files,
     ) {
-        let name_raw = &resolve.name_world_key(name);
-
-        let interface = &resolve.interfaces[iface];
-
-        let struct_name = match name {
-            WorldKey::Name(name) => name,
-            WorldKey::Interface(_) => interface.name.as_ref().unwrap(),
-        };
-
-        uwriteln!(
-            self.imports,
-            "pub const {} = struct {{",
-            valid_zig_identifier(struct_name),
-        );
-
-        for (_name, func) in interface.functions.iter() {
-            let import_source = import(resolve, name_raw, func);
-            self.imports.push_str(&import_source);
+        let mut import_source = Source::default();
+        for (_name, func) in resolve.interfaces[iface].functions.iter() {
+            import_source.push_str(&import(resolve, &resolve.name_world_key(name), func));
         }
-
-        uwriteln!(self.imports, "}};");
+        self.import_scopes.push(resolve, name, import_source);
     }
 
     fn export_interface(
@@ -80,20 +146,11 @@ impl WorldGenerator for Zig {
         iface: InterfaceId,
         _files: &mut Files,
     ) -> anyhow::Result<()> {
-        let name_raw = &resolve.name_world_key(name);
-
-        let interface = &resolve.interfaces[iface];
-        let struct_name = match name {
-            WorldKey::Name(name) => name,
-            WorldKey::Interface(_) => interface.name.as_ref().unwrap(),
-        };
-
-        uwriteln!(self.exports, "pub const {} = struct {{", struct_name);
-        for (_name, func) in interface.functions.iter() {
-            self.exports
-                .push_str(&export(resolve, Some(name_raw), func));
+        let mut export_source = Source::default();
+        for (_name, func) in resolve.interfaces[iface].functions.iter() {
+            export_source.push_str(&export(resolve, Some(name), func));
         }
-        uwriteln!(self.exports, "}};");
+        self.export_scopes.push(resolve, name, export_source);
 
         Ok(())
     }
@@ -105,10 +162,11 @@ impl WorldGenerator for Zig {
         funcs: &[(&str, &Function)],
         _files: &mut Files,
     ) {
+        let mut import_source = Source::default();
         for (_name, func) in funcs.iter() {
-            let import_source = import(resolve, "$root", func);
-            self.imports.push_str(&import_source);
+            import_source.push_str(&import(resolve, "$root", func));
         }
+        self.import_scopes.push_flat(import_source);
     }
 
     fn export_funcs(
@@ -118,9 +176,11 @@ impl WorldGenerator for Zig {
         funcs: &[(&str, &Function)],
         _files: &mut Files,
     ) -> anyhow::Result<()> {
+        let mut export_source = Source::default();
         for (_name, func) in funcs.iter() {
-            self.exports.push_str(&export(resolve, None, func));
+            export_source.push_str(&export(resolve, None, func));
         }
+        self.export_scopes.push_flat(export_source);
         Ok(())
     }
 
@@ -137,25 +197,41 @@ impl WorldGenerator for Zig {
     fn finish(&mut self, resolve: &Resolve, world: WorldId, files: &mut Files) {
         let file_name = format!("{}.zig", &resolve.worlds[world].name.to_snake_case());
 
-        files.push(&file_name, self.imports.as_bytes());
-        files.push(&file_name, b"\n");
+        let mut total_source = Source::default();
 
-        let mut exports = Source::default();
-        exports.push_str("pub const exports = struct {\n");
-        match &self.opts.exports_file {
-            Some(exports_file) => uwriteln!(
-                exports,
-                "const __user_exports = @import(\"{}\");\n\n",
-                exports_file,
-            ),
-            None => uwriteln!(exports, "const __user_exports = stubs;\n\n"),
+        total_source.push_str(&self.import_scopes.get_source());
+
+        if !self.export_scopes.is_empty() {
+            total_source.push_str("const exports = struct {\n");
+            match &self.opts.exports_file {
+                Some(exports_file) => uwriteln!(
+                    total_source,
+                    "const __user_exports = @import(\"{}\");\n",
+                    exports_file,
+                ),
+                None => uwriteln!(total_source, "const __user_exports = stub;\n"),
+            }
+            total_source.push_str(&self.export_scopes.get_source());
+            total_source.push_str("};\n");
+            total_source.push_str(
+                r"
+comptime {
+    refAllStructDeclsRecursive(exports);
+}
+
+fn refAllStructDeclsRecursive(comptime T: type) void {
+    inline for (@typeInfo(T).Struct.decls) |decl| {
+        const sub_decl = @field(T, decl.name);
+        if (@typeInfo(sub_decl) == .Struct) {
+            refAllStructDeclsRecursive(sub_decl);
         }
-        exports.push_str(&self.exports);
-        exports.push_str("};\n\n");
+    }
+}
+                ",
+            )
+        }
 
-        exports.push_str("comptime {\n_ = exports;\n}\n");
-
-        files.push(&file_name, exports.as_bytes());
+        files.push(&file_name, total_source.as_bytes());
     }
 }
 
@@ -172,7 +248,7 @@ fn import(resolve: &Resolve, library_name: &str, func: &Function) -> Source {
     uwriteln!(
         src,
         "pub fn {}({}) {} {{",
-        func.name.to_snake_case(),
+        func.name.to_lower_camel_case(),
         func.params
             .iter()
             .map(|(name, wit_type)| format!(
@@ -203,13 +279,13 @@ fn import(resolve: &Resolve, library_name: &str, func: &Function) -> Source {
     src
 }
 
-fn export(resolve: &Resolve, interface_name: Option<&str>, func: &Function) -> Source {
+fn export(resolve: &Resolve, name: Option<&WorldKey>, func: &Function) -> Source {
     let sig = resolve.wasm_signature(AbiVariant::GuestExport, func);
 
     let mut src = Source::default();
 
-    let export_func_name = match interface_name {
-        Some(i) => format!("{}#{}", i, func.name),
+    let export_func_name = match name {
+        Some(name) => format!("{}#{}", resolve.name_world_key(name), func.name),
         None => func.name.clone(),
     };
 
@@ -232,7 +308,10 @@ fn export(resolve: &Resolve, interface_name: Option<&str>, func: &Function) -> S
     );
 
     let mut func_bindgen = FunctionBindgen::new(resolve, None);
-    func_bindgen.export_name = Some("TestWorld".to_string());
+    func_bindgen.export_path = Some(match name {
+        Some(name) => get_path(resolve, name),
+        None => vec![],
+    });
     for i in 0..sig.params.len() {
         func_bindgen.params.push(format!("p{i}"));
     }
@@ -327,7 +406,7 @@ struct FunctionBindgen<'a> {
     params: Vec<String>,
     src: Source,
     sizes: SizeAlign,
-    export_name: Option<String>,
+    export_path: Option<Vec<String>>,
     wasm_import_module: Option<&'a str>,
 }
 
@@ -339,7 +418,7 @@ impl<'a> FunctionBindgen<'a> {
             params: Vec::new(),
             src: Source::default(),
             sizes,
-            export_name: None,
+            export_path: None,
             wasm_import_module,
         }
     }
@@ -395,13 +474,22 @@ impl Bindgen for FunctionBindgen<'_> {
                     }
                 }
 
-                uwriteln!(
-                    self.src,
-                    "__user_exports.{}.{}({});",
-                    self.export_name.clone().unwrap(),
-                    func.name.to_lower_camel_case(),
-                    operands.join(", ")
-                );
+                if !self.export_path.as_ref().unwrap().is_empty() {
+                    uwriteln!(
+                        self.src,
+                        "__user_exports.{}.{}({});",
+                        self.export_path.as_ref().unwrap().join("."),
+                        func.name.to_lower_camel_case(),
+                        operands.join(", ")
+                    );
+                } else {
+                    uwriteln!(
+                        self.src,
+                        "__user_exports.{}({});",
+                        func.name.to_lower_camel_case(),
+                        operands.join(", ")
+                    );
+                }
             }
             Instruction::Return { amt, func: _ } => {
                 assert!(*amt <= 1);
